@@ -11,8 +11,8 @@
 
 
 
-# 三、 實現方法 (Implementation Method)
-# 3.1 硬體架構 (System Architecture)
+# 三、 實現方法 
+#
 # 本系統採用模組化設計，核心硬體清單如下：
 # 運算核心： Raspberry Pi Pico 2 W。採用 RP2350 雙核心晶片，負責高效能的訊號處理與邏輯運算。
 #
