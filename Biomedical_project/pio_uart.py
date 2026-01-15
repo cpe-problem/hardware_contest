@@ -1,3 +1,4 @@
+#這是專門負責用 PIO 收資料的模組
 import rp2
 from machine import Pin
 
