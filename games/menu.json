@@ -1,0 +1,120 @@
+{
+  "config": {
+    "exit_button": "GP17",
+    "exit_hold_ms": 1000
+  },
+
+  "title": "Main Menu",
+
+  "items": {
+    "Start Game": {
+      "type": "submenu",
+      "items": {
+        
+        "Tetris": {
+          "type": "action",
+          "action": "start_tetris"
+        },
+
+        "Guess Number": {
+          "type": "submenu",
+          "items": {
+            "Easy (1-50)": {
+              "type": "action",
+              "action": "guess_easy"
+            },
+            "Normal (1-100)": {
+              "type": "action",
+              "action": "guess_normal"
+            },
+            "Hard (1-1000)": {
+              "type": "action",
+              "action": "guess_hard"
+            },
+            "Versus Mode": {
+              "type": "action",
+              "action": "guess_versus"
+            },
+            "Back": {
+              "type": "action",
+              "action": "back_to_main"
+            }
+          }
+        },
+
+        "Maze Game": {
+          "type": "submenu",
+          "items": {
+            "Easy": {
+              "type": "action",
+              "action": "maze_easy"
+            },
+            "Normal": {
+              "type": "action",
+              "action": "maze_normal"
+            },
+            "Hard": {
+              "type": "action",
+              "action": "maze_hard"
+            },
+            "Back": {
+              "type": "action",
+              "action": "back_to_main"
+            }
+          }
+        },
+
+        "Space Shooter": {
+          "type": "action",
+          "action": "start_shooter"
+        },
+
+        "Table Tennis": {
+          "type": "action",
+          "action": "start_table_tennis"
+        },
+
+        "Back": {
+          "type": "action",
+          "action": "back_to_main"
+        }
+      }
+    },
+
+    "Settings": {
+      "type": "submenu",
+      "items": {
+        "Volume": {
+          "type": "range",
+          "param": "volume",
+          "min": 0,
+          "max": 10,
+          "step": 1,
+          "default": 5
+        },
+        "Brightness": {
+          "type": "range",
+          "param": "brightness",
+          "min": 0,
+          "max": 10,
+          "step": 1,
+          "default": 5
+        },
+        "Back": {
+          "type": "action",
+          "action": "back_to_main"
+        }
+      }
+    },
+
+    "High Scores": {
+      "type": "action",
+      "action": "show_high_scores"
+    },
+
+    "About": {
+      "type": "action",
+      "action": "show_about"
+    }
+  }
+}
