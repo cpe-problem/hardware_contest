@@ -1,339 +1,404 @@
 from machine import Pin, PWM, I2C, ADC
 import time, random
-import ssd1306  # 必須先上傳 ssd1306.py
+import ssd1306
 
 # ==============================================
-# 硬體抽象層 (新增部分)
-# 定義 DisplayUnit 和 InputUnit 類別
+# 硬體驅動層
 # ==============================================
-
 class DisplayUnit:
     def __init__(self):
-        # 設定 I2C (SDA=GP0, SCL=GP1)
-        self.i2c = I2C(1, sda=Pin(14), scl=Pin(15), freq=400000)
-        # 初始化 OLED (128x64)
+        self.i2c = I2C(0, sda=Pin(14), scl=Pin(15), freq=400000)
         self.oled = ssd1306.SSD1306_I2C(128, 64, self.i2c)
 
 class InputUnit:
     def __init__(self):
-        # 設定搖桿 (X=GP26, Y=GP27)
         self.joy_x = ADC(Pin(26))
         self.joy_y = ADC(Pin(27))
-        # 設定按鈕 (SW=GP16, 設定上拉電阻)
         self.btn = Pin(16, Pin.IN, Pin.PULL_UP)
+        self.last_btn_state = 1
 
-    def read_joy_x(self):
-        return self.joy_x.read_u16()
+    def read_axis(self):
+        # 回傳: 0(無), -1(左/上), 1(右/下)
+        x_val, y_val = self.joy_x.read_u16(), self.joy_y.read_u16()
+        dx, dy = 0, 0
+        if x_val < 15000: dx = -1
+        elif x_val > 50000: dx = 1
+        
+        if y_val < 15000: dy = -1 # 視安裝方向調整，假設 <15000 是上(旋轉)
+        elif y_val > 50000: dy = 1
+        return dx, dy
 
-    def read_joy_y(self):
-        return self.joy_y.read_u16()
-
-    def is_enter_pressed(self):
-        # 按下時為低電位 (0)，所以回傳 True
-        return not self.btn.value()
-
-# ==============================================
-# 你的原始遊戲邏輯 (保持不變)
-# ==============================================
-
-# 儲存紀錄
-def save_best(filename, score):
-    try:
-        with open(filename, "r") as fp:
-            old = fp.read().strip()
-            if old:
-                old = int(old)
-                if score <= old: return 
-    except:
-        pass
-    with open(filename, "w") as fp:
-        fp.write(str(score))
-
-# --- 音效 ---
-buzzer = None
-def sound_move():
-    if buzzer:
-        buzzer.freq(400); buzzer.duty_u16(5000)
-        time.sleep(0.01); buzzer.duty_u16(0)
-
-def sound_rotate():
-    if buzzer:
-        buzzer.freq(600); buzzer.duty_u16(5000)
-        time.sleep(0.01); buzzer.duty_u16(0)
-
-def sound_land():
-    if buzzer:
-        buzzer.freq(150); buzzer.duty_u16(10000)
-        time.sleep(0.05); buzzer.duty_u16(0)
-
-def sound_clear():
-    if buzzer:
-        notes = [880, 1175, 1760] # A5, D6, A6
-        for n in notes:
-            buzzer.freq(n); buzzer.duty_u16(32768)
-            time.sleep(0.08)
-        buzzer.duty_u16(0)
+    def check_btn_press(self):
+        # 偵測按鈕剛被按下的瞬間 (Rising Edge)
+        curr = self.btn.value()
+        is_pressed = False
+        if curr == 0 and self.last_btn_state == 1:
+            is_pressed = True
+        self.last_btn_state = curr
+        return is_pressed
 
 # ==============================================
-# 方塊定義 (4x4 矩陣表示)
+# 遊戲常數與形狀
 # ==============================================
-SHAPES = [
-    [[1, 1, 1, 1]], # I (長條)
-    
-    [[1, 1], 
-     [1, 1]],       # O (正方)
-    
-    [[0, 1, 0],
-     [1, 1, 1]],    # T
-     
-    [[1, 0, 0],
-     [1, 1, 1]],    # L
-     
-    [[0, 0, 1],
-     [1, 1, 1]],    # J
-     
-    [[0, 1, 1],
-     [1, 1, 0]],    # S
-     
-    [[1, 1, 0],
-     [0, 1, 1]]     # Z
+BLOCK_SIZE = 4
+FIELD_W, FIELD_H = 10, 16
+OFFSET_X, OFFSET_Y = 34, 0  # 將遊戲區移到中間，左邊放 Hold，右邊放 Next
+
+# 定義形狀與其 ID (用於顏色或邏輯區分)
+# 格式: [形狀矩陣, ID]
+SHAPES_DEF = [
+    ([[1, 1, 1, 1]], 1),             # I
+    ([[1, 1], [1, 1]], 2),           # O
+    ([[0, 1, 0], [1, 1, 1]], 3),     # T
+    ([[1, 0, 0], [1, 1, 1]], 4),     # L
+    ([[0, 0, 1], [1, 1, 1]], 5),     # J
+    ([[0, 1, 1], [1, 1, 0]], 6),     # S
+    ([[1, 1, 0], [0, 1, 1]], 7)      # Z
 ]
 
-# ==============================================
-# Tetris 主邏輯
-# ==============================================
-def start_tetris_game(display_unit, input_unit):
-    global buzzer
-    oled = display_unit.oled
-    # 初始化蜂鳴器 pin 9
-    buzzer = PWM(Pin(9))
-    buzzer.duty_u16(0)
+# SRS Wall Kick 測試偏移量 (標準 SRS 很複雜，這裡用簡化版：左右、上、上左、上右)
+# 順序：原點 -> 左 -> 右 -> 上(由地板踢起) -> 左上 -> 右上
+KICK_OFFSETS = [(0,0), (-1,0), (1,0), (0,-1), (-1,-1), (1,-1)]
 
-    # --- 參數設定 ---
-    BLOCK_SIZE = 4       # 每個方塊 4x4 像素
-    FIELD_W = 10         # 寬度 10 格
-    FIELD_H = 16         # 高度 16 格 (16*4 = 64 pixels, 剛好滿屏)
-    OFFSET_X = 2         # 畫面左邊留 2 pixel
-    OFFSET_Y = 0
-    
-    # 遊戲區域 (0:空, 1:有方塊)
-    field = [[0] * FIELD_W for _ in range(FIELD_H)]
-    
-    score = 0
-    lines_cleared = 0
-    game_over = False
-    
-    # ADC 讀數範圍 0-65535，中間約 32768
-    JOY_LOW = 15000
-    JOY_HIGH = 50000
-    
-    # --- 輔助函式：檢查碰撞 ---
-    def check_collision(shape, ox, oy):
+class TetrisGame:
+    def __init__(self, display, inputs):
+        self.disp = display
+        self.oled = display.oled
+        self.inputs = inputs
+        self.buzzer = PWM(Pin(9))
+        self.buzzer.duty_u16(0)
+        
+        self.reset_game()
+
+    def reset_game(self):
+        self.field = [[0] * FIELD_W for _ in range(FIELD_H)]
+        self.score = 0
+        self.lines = 0
+        self.level = 1
+        self.game_over = False
+        
+        # 7-Bag 系統
+        self.bag = []
+        self.hold_shape = None
+        self.hold_used = False  # 每個方塊只能 Hold 一次
+        
+        self.current_shape = None
+        self.current_id = 0
+        self.cx, self.cy = 0, 0
+        
+        self.next_shape_def = self.get_from_bag()
+        self.spawn_piece()
+        
+        # 計時器
+        self.fall_speed = 1000  # ms
+        self.last_fall_time = time.ticks_ms()
+        
+        # 鎖定延遲 (Lock Delay)
+        self.lock_delay = 500   # ms
+        self.lock_timer = None  # None 表示沒接觸地面
+        self.moves_reset_cnt = 0 # 限制在地板上移動重置計時器的次數 (防無限拖延)
+
+    # --- 7-Bag 隨機生成 ---
+    def get_from_bag(self):
+        if not self.bag:
+            self.bag = list(SHAPES_DEF) # 複製一份
+            random.shuffle(self.bag)
+        return self.bag.pop()
+
+    def spawn_piece(self):
+        self.current_shape = self.next_shape_def[0]
+        self.current_id = self.next_shape_def[1]
+        self.next_shape_def = self.get_from_bag()
+        
+        self.cx = FIELD_W // 2 - len(self.current_shape[0]) // 2
+        self.cy = -len(self.current_shape) # 從畫面上方生成
+        
+        self.hold_used = False
+        self.lock_timer = None
+        self.moves_reset_cnt = 0
+
+        # 檢查是否一出生就死
+        if self.check_collision(self.current_shape, self.cx, self.cy):
+            self.game_over = True
+
+    # --- 核心邏輯 ---
+    def check_collision(self, shape, ox, oy):
         for y, row in enumerate(shape):
             for x, val in enumerate(row):
                 if val:
-                    # 檢查邊界
-                    if ox + x < 0 or ox + x >= FIELD_W or oy + y >= FIELD_H:
+                    bx = ox + x
+                    by = oy + y
+                    if bx < 0 or bx >= FIELD_W or by >= FIELD_H:
                         return True
-                    # 檢查是否重疊已存在的方塊 (忽略上方還沒進場的部分 oy+y < 0)
-                    if oy + y >= 0 and field[oy + y][ox + x]:
+                    if by >= 0 and self.field[by][bx]:
                         return True
         return False
 
-    # --- 輔助函式：將方塊固定到場地 ---
-    def freeze_shape(shape, ox, oy):
-        for y, row in enumerate(shape):
-            for x, val in enumerate(row):
-                if val and oy + y >= 0:
-                    field[oy + y][ox + x] = 1
-
-    # --- 輔助函式：旋轉方塊 ---
-    def rotate_shape(shape):
+    def rotate_matrix(self, shape):
         return [list(row) for row in zip(*shape[::-1])]
 
-    # --- 生成新方塊 ---
-    def new_piece():
-        idx = random.randint(0, len(SHAPES) - 1)
-        shape = SHAPES[idx]
-        # 初始位置：中間上方
-        px = FIELD_W // 2 - len(shape[0]) // 2
-        py = -len(shape) # 從畫面外開始
-        return shape, px, py
-
-    current_shape, cx, cy = new_piece()
-    
-    # 遊戲迴圈控制
-    fall_speed = 15      # 自動掉落速度 (幀數)
-    fall_counter = 0
-    input_delay = 0      # 按鍵冷卻
-
-    # 開場畫面
-    oled.fill(0)
-    oled.text("Ready?", 30, 25)
-    oled.show()
-    time.sleep(1)
-
-    while True:
-        # 暫停/退出檢查
-        if input_unit.is_enter_pressed():
-            buzzer.duty_u16(0)
-            oled.fill(0); oled.text("PAUSED", 30, 30); oled.show()
-            time.sleep(0.5)
-            while not input_unit.is_enter_pressed(): time.sleep(0.1)
-            time.sleep(0.5)
-
-        if not game_over:
-            # === 輸入處理 ===
-            jx = input_unit.read_joy_x()
-            jy = input_unit.read_joy_y()
-            
-            # 左右移動 (帶延遲避免跑太快)
-            if input_delay == 0:
-                if jx < JOY_LOW:  # 左
-                    if not check_collision(current_shape, cx - 1, cy):
-                        cx -= 1
-                        sound_move()
-                        input_delay = 3
-                elif jx > JOY_HIGH: # 右
-                    if not check_collision(current_shape, cx + 1, cy):
-                        cx += 1
-                        sound_move()
-                        input_delay = 3
+    # SRS Wall Kick 嘗試
+    def try_rotate(self):
+        new_shape = self.rotate_matrix(self.current_shape)
+        
+        # 嘗試踢牆
+        for dx, dy in KICK_OFFSETS:
+            if not self.check_collision(new_shape, self.cx + dx, self.cy + dy):
+                self.current_shape = new_shape
+                self.cx += dx
+                self.cy += dy
+                self.play_sound(600, 10)
+                self.reset_lock_delay()
+                return # 成功就結束
                 
-                # 旋轉 (搖桿往上 -> Y值可能變小或變大，視安裝方向而定，假設 < Low 是上)
-                if jy < JOY_LOW:
-                    rotated = rotate_shape(current_shape)
-                    if not check_collision(rotated, cx, cy):
-                        current_shape = rotated
-                        sound_rotate()
-                        input_delay = 5 # 旋轉冷卻長一點
-                        
-                # 加速掉落 (搖桿往下)
-                if jy > JOY_HIGH:
-                    fall_counter = fall_speed # 強制觸發掉落
-            
-            if input_delay > 0: input_delay -= 1
+    def reset_lock_delay(self):
+        # 只要有成功操作，且在地板上，且次數未滿，重置鎖定計時
+        if self.lock_timer is not None and self.moves_reset_cnt < 15:
+            self.lock_timer = time.ticks_ms()
+            self.moves_reset_cnt += 1
 
-            # === 自動掉落機制 ===
-            fall_counter += 1
-            if fall_counter >= fall_speed:
-                fall_counter = 0
-                if not check_collision(current_shape, cx, cy + 1):
-                    cy += 1
-                else:
-                    # 落地
-                    sound_land()
-                    freeze_shape(current_shape, cx, cy)
-                    
-                    # 檢查是否輸了 (方塊還在頂部就碰撞)
-                    if cy < 0:
-                        game_over = True
-                    else:
-                        # === 消除行檢查 ===
-                        full_lines = []
-                        for y in range(FIELD_H):
-                            if all(field[y]): # 整行都是 1
-                                full_lines.append(y)
-                        
-                        if full_lines:
-                            sound_clear()
-                            # 視覺特效：閃爍消除的行
-                            for _ in range(3):
-                                oled.fill(0)
-                                # 畫邊框
-                                oled.rect(0, 0, FIELD_W*BLOCK_SIZE + 4, 64, 1)
-                                # 只畫這幾行
-                                for fy in full_lines:
-                                    oled.fill_rect(OFFSET_X, fy*BLOCK_SIZE, FIELD_W*BLOCK_SIZE, BLOCK_SIZE, 1)
-                                oled.show()
-                                time.sleep(0.05)
-                                oled.fill(0)
-                                oled.show()
-                                time.sleep(0.05)
-                            
-                            # 移除行並下墜
-                            for fy in full_lines:
-                                del field[fy]
-                                field.insert(0, [0] * FIELD_W) # 補空行在頂部
-                            
-                            # 計分 (1行10, 2行30, 3行60, 4行100)
-                            count = len(full_lines)
-                            score += count * 10 * count
-                            lines_cleared += count
-                            
-                            # 難度增加
-                            if lines_cleared > 5: fall_speed = 12
-                            if lines_cleared > 10: fall_speed = 10
-                            if lines_cleared > 20: fall_speed = 5
-
-                        # 生成新方塊
-                        current_shape, cx, cy = new_piece()
-
-            # === 繪圖 ===
-            oled.fill(0)
-            
-            # 1. 畫邊框 (左側遊戲區)
-            # 寬度 = 10格 * 4pixel + 邊框線
-            game_w_px = FIELD_W * BLOCK_SIZE
-            oled.rect(0, 0, game_w_px + 4, 64, 1)
-            
-            # 2. 畫已固定的方塊
-            for y in range(FIELD_H):
-                for x in range(FIELD_W):
-                    if field[y][x]:
-                        # 實心方塊
-                        oled.fill_rect(OFFSET_X + x*BLOCK_SIZE, OFFSET_Y + y*BLOCK_SIZE, BLOCK_SIZE-1, BLOCK_SIZE-1, 1)
-
-            # 3. 畫當前移動中的方塊
-            for y, row in enumerate(current_shape):
-                for x, val in enumerate(row):
-                    if val:
-                        draw_x = OFFSET_X + (cx + x) * BLOCK_SIZE
-                        draw_y = OFFSET_Y + (cy + y) * BLOCK_SIZE
-                        # 只畫在畫面內的
-                        if draw_y >= 0:
-                            oled.fill_rect(draw_x, draw_y, BLOCK_SIZE-1, BLOCK_SIZE-1, 1)
-
-            # 4. 畫 UI (右側)
-            ui_x = game_w_px + 6
-            oled.text("TETRIS", ui_x, 0)
-            oled.text(f"Sc:{score}", ui_x, 15)
-            oled.text(f"Ln:{lines_cleared}", ui_x, 25)
-            
-            # 顯示下一個難度提示
-            oled.text(f"Spd:{16-fall_speed}", ui_x, 40) # 數字越大越快
-
-            oled.show()
-            time.sleep(0.02) # 約 50 FPS
-
+    def handle_hold(self):
+        if self.hold_used: return
+        
+        self.play_sound(1000, 20)
+        if self.hold_shape is None:
+            # 第一次 Hold：存入當前，拿出 Next
+            self.hold_shape = (self.current_shape, self.current_id)
+            self.spawn_piece() # 這裡會把 Next 變成 Current
         else:
-            # 遊戲結束
-            oled.fill(0)
-            oled.text("GAME OVER", 25, 20)
-            oled.text(f"Score: {score}", 25, 40)
-            oled.show()
-            save_best("best_tetris.txt", score)
+            # 交換
+            temp = (self.current_shape, self.current_id)
+            self.current_shape = self.hold_shape[0]
+            self.current_id = self.hold_shape[1]
+            self.hold_shape = temp
             
-            # 這裡加個長延遲，避免馬上跳掉
-            time.sleep(2)
+            # 重置位置
+            self.cx = FIELD_W // 2 - len(self.current_shape[0]) // 2
+            self.cy = -len(self.current_shape)
+            self.lock_timer = None
+            self.moves_reset_cnt = 0
             
-            # 等待按下按鈕重來
-            while not input_unit.is_enter_pressed(): 
-                time.sleep(0.1)
-            return
+        self.hold_used = True
+
+    # --- T-Spin 偵測 ---
+    def detect_t_spin(self):
+        if self.current_id != 3: return False # 只有 T 塊才算
+        # 檢查 T 方塊的四個角落 (Bounding Box 的 0,0 / 2,0 / 0,2 / 2,2)
+        # 簡單判定：只要這四個角有 3 個以上被佔據（牆壁或方塊），且最後動作是旋轉，就算 T-Spin
+        # 這裡簡化為檢查角落佔用，不嚴格檢查 "最後動作是旋轉" (因為這需要額外變數追蹤)
+        
+        corners = [(0,0), (2,0), (0,2), (2,2)]
+        occupied = 0
+        for dx, dy in corners:
+            chk_x = self.cx + dx
+            chk_y = self.cy + dy
+            if chk_x < 0 or chk_x >= FIELD_W or chk_y >= FIELD_H:
+                occupied += 1
+            elif chk_y >= 0 and self.field[chk_y][chk_x]:
+                occupied += 1
+        
+        return occupied >= 3
+
+    # --- 遊戲循環與繪圖 ---
+    def update(self):
+        now = time.ticks_ms()
+        dx, dy = self.inputs.read_axis()
+        
+        # 1. 處理移動與旋轉
+        moved = False
+        if dx != 0: 
+            if not self.check_collision(self.current_shape, self.cx + dx, self.cy):
+                self.cx += dx
+                self.play_sound(400, 5)
+                self.reset_lock_delay()
+                moved = True
+            time.sleep(0.05) # 簡單的移動延遲
+
+        if dy == -1: # 上：旋轉
+            self.try_rotate()
+            time.sleep(0.15) # 旋轉冷卻
+        
+        if self.inputs.check_btn_press(): # 按鈕：Hold
+            self.handle_hold()
+
+        # 2. 處理下落與鎖定
+        soft_drop = (dy == 1)
+        # 如果按下，加速下落
+        current_speed = self.fall_speed // 4 if soft_drop else self.fall_speed
+        
+        # 幽靈方塊位置計算 (Ghost Piece)
+        ghost_y = self.cy
+        while not self.check_collision(self.current_shape, self.cx, ghost_y + 1):
+            ghost_y += 1
+        
+        # 檢查是否著地
+        is_on_ground = self.check_collision(self.current_shape, self.cx, self.cy + 1)
+        
+        if is_on_ground:
+            if self.lock_timer is None:
+                self.lock_timer = now # 開始鎖定倒數
+            
+            # 鎖定時間到 或 強制下落
+            if (now - self.lock_timer > self.lock_delay) or (soft_drop and now - self.last_fall_time > 50):
+                self.lock_piece()
+        else:
+            self.lock_timer = None
+            if now - self.last_fall_time > current_speed:
+                self.cy += 1
+                self.last_fall_time = now
+
+    def lock_piece(self):
+        # 檢查 T-Spin
+        is_tspin = self.detect_t_spin()
+        
+        # 固定方塊
+        for y, row in enumerate(self.current_shape):
+            for x, val in enumerate(row):
+                if val and self.cy + y >= 0:
+                    self.field[self.cy + y][self.cx + x] = 1
+        
+        self.play_sound(150, 50) # 落地聲
+        
+        # 消除行與計分
+        full_lines = []
+        for y in range(FIELD_H):
+            if all(self.field[y]):
+                full_lines.append(y)
+        
+        if full_lines:
+            self.play_sound_clear()
+            # 視覺閃爍
+            self.oled.fill_rect(OFFSET_X, full_lines[0]*BLOCK_SIZE, FIELD_W*BLOCK_SIZE, len(full_lines)*BLOCK_SIZE, 0)
+            self.oled.show()
+            time.sleep(0.1)
+            
+            # 移除行
+            for fy in full_lines:
+                del self.field[fy]
+                self.field.insert(0, [0] * FIELD_W)
+            
+            # 計分邏輯 (含 T-Spin 加成)
+            cnt = len(full_lines)
+            base_score = [0, 100, 300, 500, 800] # 0, 1, 2, 3, 4 lines
+            points = base_score[cnt]
+            if is_tspin:
+                points *= 2 # T-Spin 雙倍分
+                self.draw_popup("T-SPIN!")
+            
+            self.score += points * self.level
+            self.lines += cnt
+            
+            # 升級 (每 10 行)
+            if self.lines // 10 >= self.level:
+                self.level += 1
+                self.fall_speed = max(100, 1000 - (self.level * 80))
+
+        self.spawn_piece()
+
+    def draw(self):
+        self.oled.fill(0)
+        
+        # --- UI 框架 ---
+        # 左側 Hold
+        self.oled.text("H", 0, 0)
+        self.oled.rect(0, 10, 26, 26, 1)
+        if self.hold_shape:
+            self.draw_mini_piece(self.hold_shape[0], 2, 12)
+            
+        # 中間遊戲區 (邊框)
+        self.oled.rect(OFFSET_X - 2, 0, FIELD_W * BLOCK_SIZE + 4, 64, 1)
+        
+        # 右側 Next 與資訊
+        self.oled.text("N", 90, 0)
+        self.oled.rect(90, 10, 26, 26, 1)
+        self.draw_mini_piece(self.next_shape_def[0], 92, 12)
+        
+        self.oled.text(f"{self.score}", 85, 40)
+        self.oled.text(f"Lv{self.level}", 85, 50)
+
+        # --- 遊戲內容 ---
+        # 1. 已固定方塊
+        for y in range(FIELD_H):
+            for x in range(FIELD_W):
+                if self.field[y][x]:
+                    self.oled.fill_rect(OFFSET_X + x*BLOCK_SIZE, y*BLOCK_SIZE, BLOCK_SIZE-1, BLOCK_SIZE-1, 1)
+        
+        # 2. 幽靈方塊 (Ghost Piece) - 空心框
+        ghost_y = self.cy
+        while not self.check_collision(self.current_shape, self.cx, ghost_y + 1):
+            ghost_y += 1
+        
+        for y, row in enumerate(self.current_shape):
+            for x, val in enumerate(row):
+                if val and ghost_y + y >= 0:
+                     self.oled.rect(OFFSET_X + (self.cx+x)*BLOCK_SIZE, (ghost_y+y)*BLOCK_SIZE, BLOCK_SIZE-1, BLOCK_SIZE-1, 1)
+
+        # 3. 當前移動方塊 (實心)
+        for y, row in enumerate(self.current_shape):
+            for x, val in enumerate(row):
+                if val and self.cy + y >= 0:
+                    self.oled.fill_rect(OFFSET_X + (self.cx+x)*BLOCK_SIZE, (self.cy+y)*BLOCK_SIZE, BLOCK_SIZE-1, BLOCK_SIZE-1, 1)
+                    
+        self.oled.show()
+
+    def draw_mini_piece(self, shape, ox, oy):
+        # 在 Hold/Next 框框中畫小方塊
+        for y, row in enumerate(shape):
+            for x, val in enumerate(row):
+                if val:
+                    self.oled.fill_rect(ox + x*4, oy + y*4, 3, 3, 1)
+
+    def draw_popup(self, text):
+        # 顯示短暫文字 (如 T-SPIN)
+        self.oled.fill_rect(30, 25, 68, 14, 0) # 清空背景
+        self.oled.rect(30, 25, 68, 14, 1)      # 框
+        self.oled.text(text, 35, 28)
+        self.oled.show()
+        time.sleep(0.5)
+
+    # --- 音效 ---
+    def play_sound(self, freq, duration_ms):
+        if self.buzzer:
+            self.buzzer.freq(freq)
+            self.buzzer.duty_u16(5000)
+            time.sleep_ms(duration_ms)
+            self.buzzer.duty_u16(0)
+
+    def play_sound_clear(self):
+        notes = [880, 1175, 1760]
+        for n in notes:
+            self.buzzer.freq(n); self.buzzer.duty_u16(10000)
+            time.sleep(0.08)
+        self.buzzer.duty_u16(0)
 
 # ==============================================
-# 程式進入點
+# 主程式
 # ==============================================
 if __name__ == "__main__":
+    print("Tetris Enhanced Loading...")
+    display = DisplayUnit()
+    inputs = InputUnit()
+    game = TetrisGame(display, inputs)
+    
     try:
-        display = DisplayUnit()
-        inputs = InputUnit()
         while True:
-            start_tetris_game(display, inputs)
-            time.sleep(1) # 遊戲結束後休息一下再重啟
-            
+            if not game.game_over:
+                game.update()
+                game.draw()
+            else:
+                # Game Over 畫面
+                display.oled.fill(0)
+                display.oled.text("GAME OVER", 30, 20)
+                display.oled.text(f"Score:{game.score}", 30, 35)
+                display.oled.text("Btn: Retry", 25, 50)
+                display.oled.show()
+                
+                # 等待按鈕重來
+                while not inputs.check_btn_press():
+                    time.sleep(0.05)
+                game.reset_game()
+                
     except KeyboardInterrupt:
-        print("程式停止")
+        print("Exit")
     except Exception as e:
-        print(f"發生錯誤: {e}")
+        print(e)
